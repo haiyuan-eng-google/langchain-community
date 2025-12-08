@@ -1,0 +1,759 @@
+"""BigQuery Callback Handler for LangChain (Aligned with ADK Agent Analytics Plugin)."""
+
+from __future__ import annotations
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, UTC
+import functools
+import json
+import logging
+import mimetypes
+import random
+import time
+from types import MappingProxyType
+from typing import Any, Callable, Dict, List, Optional, Union
+import uuid
+
+from langchain_core.agents import AgentAction, AgentFinish
+from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.messages import BaseMessage
+from langchain_core.outputs import LLMResult
+from langchain_core.utils import guard_import
+
+
+def import_google_cloud_bigquery() -> Any:
+  """Import google-cloud-bigquery and its dependencies."""
+  return (
+      guard_import("google.cloud.bigquery"),
+      guard_import("google.auth", pip_name="google-auth"),
+      guard_import("google.api_core.gapic_v1.client_info"),
+      guard_import(
+          "google.cloud.bigquery_storage_v1.services.big_query_write.async_client"
+      ),
+      guard_import("google.cloud.exceptions"),
+      guard_import("google.cloud.storage"),
+      guard_import("google.cloud.bigquery.schema"),
+      guard_import("google.cloud.bigquery_storage_v1.types"),
+      guard_import("google.api_core.exceptions"),
+      guard_import("pyarrow"),
+  )
+
+
+logger = logging.getLogger(__name__)
+
+# gRPC Error Codes
+_GRPC_DEADLINE_EXCEEDED = 4
+_GRPC_INTERNAL = 13
+_GRPC_UNAVAILABLE = 14
+
+
+# ==============================================================================
+# HELPER FUNCTIONS (From ADK Plugin)
+# ==============================================================================
+
+def _recursive_smart_truncate(obj: Any, max_len: int) -> tuple[Any, bool]:
+  """Recursively truncates string values within a dict or list."""
+  if isinstance(obj, str):
+    if max_len != -1 and len(obj) > max_len:
+      return obj[:max_len] + "...[TRUNCATED]", True
+    return obj, False
+  elif isinstance(obj, dict):
+    truncated_any = False
+    new_dict = {}
+    for k, v in obj.items():
+      val, trunc = _recursive_smart_truncate(v, max_len)
+      if trunc:
+        truncated_any = True
+      new_dict[k] = val
+    return new_dict, truncated_any
+  elif isinstance(obj, (list, tuple)):
+    truncated_any = False
+    new_list = []
+    for i in obj:
+      val, trunc = _recursive_smart_truncate(i, max_len)
+      if trunc:
+        truncated_any = True
+      new_list.append(val)
+    return type(obj)(new_list), truncated_any
+  return obj, False
+
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+@dataclass
+class RetryConfig:
+  max_retries: int = 3
+  initial_delay: float = 1.0
+  multiplier: float = 2.0
+  max_delay: float = 10.0
+
+@dataclass
+class BigQueryLoggerConfig:
+  enabled: bool = True
+  event_allowlist: list[str] | None = None
+  event_denylist: list[str] | None = None
+  max_content_length: int = 500 * 1024
+  table_id: str = "agent_events_v2"
+  clustering_fields: list[str] = field(default_factory=lambda: ["event_type", "agent", "user_id"])
+  log_multi_modal_content: bool = True
+  retry_config: RetryConfig = field(default_factory=RetryConfig)
+  batch_size: int = 1
+  batch_flush_interval: float = 1.0
+  shutdown_timeout: float = 10.0
+  queue_max_size: int = 10000
+  gcs_bucket_name: Optional[str] = None
+
+
+# ==============================================================================
+# CORE COMPONENTS (BatchProcessor, Offloader)
+# ==============================================================================
+
+class BatchProcessor:
+  """Handles asynchronous batching and writing of events to BigQuery."""
+  
+  def __init__(self, write_client, arrow_schema, write_stream, batch_size, flush_interval, retry_config, queue_max_size, bq_storage_types, service_unavailable_exception):
+    self.write_client = write_client
+    self.arrow_schema = arrow_schema
+    self.write_stream = write_stream
+    self.batch_size = batch_size
+    self.flush_interval = flush_interval
+    self.retry_config = retry_config
+    self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=queue_max_size)
+    self._worker_task: Optional[asyncio.Task] = None
+    self._shutdown = False
+    self.bq_storage_types = bq_storage_types
+    self.service_unavailable_exception = service_unavailable_exception
+
+  async def start(self):
+    if self._worker_task is None:
+      self._worker_task = asyncio.create_task(self._batch_writer())
+
+  async def append(self, row: dict[str, Any]) -> None:
+    try:
+      self._queue.put_nowait(row)
+    except asyncio.QueueFull:
+      logger.warning("BigQuery log queue full, dropping event.")
+
+  def _prepare_arrow_batch(self, rows: list[dict[str, Any]]) -> Any:
+    import pyarrow as pa
+    data = {field.name: [] for field in self.arrow_schema}
+    for row in rows:
+      for field in self.arrow_schema:
+        value = row.get(field.name)
+        # JSON Handling
+        field_metadata = self.arrow_schema.field(field.name).metadata
+        is_json = False
+        if field_metadata and b"ARROW:extension:name" in field_metadata:
+          if field_metadata[b"ARROW:extension:name"] == b"google:sqlType:json":
+            is_json = True
+        
+        arrow_field_type = self.arrow_schema.field(field.name).type
+        is_struct = pa.types.is_struct(arrow_field_type)
+        is_list = pa.types.is_list(arrow_field_type)
+
+        if is_json:
+          if value is not None:
+            if isinstance(value, (dict, list)):
+              try: value = json.dumps(value)
+              except (TypeError, ValueError): value = str(value)
+            elif isinstance(value, (str, bytes)):
+                if isinstance(value, bytes):
+                    try: value = value.decode("utf-8")
+                    except UnicodeDecodeError: value = str(value)
+                
+                is_already_json = False
+                if isinstance(value, str):
+                    stripped = value.strip()
+                    if stripped.startswith(("{", "[")) and stripped.endswith(("}", "]")):
+                        try:
+                            json.loads(value)
+                            is_already_json = True
+                        except (ValueError, TypeError): pass
+                
+                if not is_already_json:
+                    try: value = json.dumps(value)
+                    except (TypeError, ValueError): value = str(value)
+            else:
+                try: value = json.dumps(value)
+                except (TypeError, ValueError): value = str(value)
+        elif isinstance(value, (dict, list)) and not is_struct and not is_list:
+           if value is not None and not isinstance(value, (str, bytes)):
+             try: value = json.dumps(value)
+             except (TypeError, ValueError): value = str(value)
+             
+        data[field.name].append(value)
+    return pa.RecordBatch.from_pydict(data, schema=self.arrow_schema)
+
+  async def _batch_writer(self) -> None:
+    while not self._shutdown or not self._queue.empty():
+      batch = []
+      try:
+        if self._shutdown:
+            try: batch.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty: break
+        else:
+            batch.append(await asyncio.wait_for(self._queue.get(), timeout=self.flush_interval))
+        self._queue.task_done()
+        
+        while len(batch) < self.batch_size:
+            try:
+                batch.append(self._queue.get_nowait())
+                self._queue.task_done()
+            except asyncio.QueueEmpty: break
+        
+        if batch: await self._write_rows_with_retry(batch)
+      except asyncio.TimeoutError: continue
+      except asyncio.CancelledError:
+        logger.info("Batch writer task cancelled.")
+        break
+      except Exception as e:
+        logger.error("Error in batch writer: %s", e, exc_info=True)
+        await asyncio.sleep(1)
+
+  async def _write_rows_with_retry(self, rows: list[dict[str, Any]]) -> None:
+    attempt = 0
+    delay = self.retry_config.initial_delay
+    try:
+      arrow_batch = self._prepare_arrow_batch(rows)
+      serialized_schema = self.arrow_schema.serialize().to_pybytes()
+      serialized_batch = arrow_batch.serialize().to_pybytes()
+      req = self.bq_storage_types.AppendRowsRequest(write_stream=self.write_stream, trace_id=f"langchain-bq-callback")
+      req.arrow_rows.writer_schema.serialized_schema = serialized_schema
+      req.arrow_rows.rows.serialized_record_batch = serialized_batch
+    except Exception as e:
+      logger.error("Failed to prepare Arrow batch (Data Loss): %s", e, exc_info=True)
+      return
+
+    while attempt <= self.retry_config.max_retries:
+      try:
+        async def req_iter(): yield req
+        responses = await self.write_client.append_rows(req_iter())
+        async for response in responses:
+            error = getattr(response, "error", None)
+            error_code = getattr(error, "code", None)
+            if error_code and error_code != 0:
+                error_message = getattr(error, "message", "Unknown error")
+                logger.warning("BigQuery Write API returned error code %s: %s", error_code, error_message)
+                if error_code in [_GRPC_DEADLINE_EXCEEDED, _GRPC_INTERNAL, _GRPC_UNAVAILABLE]:
+                    raise self.service_unavailable_exception(error_message)
+                else:
+                    if "schema mismatch" in error_message.lower():
+                        logger.error("BigQuery Schema Mismatch: %s", error_message)
+                    else:
+                        logger.error("Non-retryable BigQuery error: %s", error_message)
+                        row_errors = getattr(response, "row_errors", [])
+                        if row_errors:
+                            for row_error in row_errors:
+                                logger.error("Row error details: %s", row_error)
+                        logger.error("Row content causing error: %s", rows)
+                    return
+        return
+      except (self.service_unavailable_exception) as e:
+        attempt += 1
+        if attempt > self.retry_config.max_retries:
+             logger.error("BigQuery Batch Dropped after %s attempts. Last error: %s", self.retry_config.max_retries + 1, e)
+             return
+        sleep_time = min(delay * (1 + random.random()), self.retry_config.max_delay)
+        logger.warning("BigQuery write failed (Attempt %s), retrying in %.2fs... Error: %s", attempt, sleep_time, e)
+        await asyncio.sleep(sleep_time)
+        delay *= self.retry_config.multiplier
+      except Exception as e:
+        logger.error("Unexpected BigQuery Write API error (Dropping batch): %s", e, exc_info=True)
+        return
+
+  async def shutdown(self, timeout: float = 5.0) -> None:
+    self._shutdown = True
+    logger.info("BatchProcessor shutting down, draining queue...")
+    if self._worker_task:
+      try:
+        await asyncio.wait_for(self._worker_task, timeout=timeout)
+      except asyncio.TimeoutError:
+         logger.warning("BatchProcessor shutdown timed out, cancelling worker.")
+         self._worker_task.cancel()
+      except Exception as e:
+         logger.error("Error during BatchProcessor shutdown: %s", e)
+
+class GCSOffloader:
+  def __init__(self, project_id: str, bucket_name: str, executor: ThreadPoolExecutor, storage_client_cls: Any):
+    self.client = storage_client_cls(project=project_id)
+    self.bucket = self.client.bucket(bucket_name)
+    self.executor = executor
+
+  async def upload_content(self, data: bytes | str, content_type: str, path: str) -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(self.executor, functools.partial(self._upload_sync, data, content_type, path))
+
+  def _upload_sync(self, data: bytes | str, content_type: str, path: str) -> str:
+    blob = self.bucket.blob(path)
+    blob.upload_from_string(data, content_type=content_type)
+    return f"gs://{self.bucket.name}/{path}"
+
+
+class LangChainContentParser:
+  """Parses LangChain content (including Multi-Modal) for logging, aligned with HybridContentParser."""
+  
+  def __init__(self, offloader: Optional[GCSOffloader], trace_id: str, span_id: str, max_length: int = 20000):
+    self.offloader = offloader
+    self.trace_id = trace_id
+    self.span_id = span_id
+    self.max_length = max_length
+    self.inline_text_limit = 32 * 1024
+
+  def _truncate(self, text: str) -> tuple[str, bool]:
+    if self.max_length != -1 and len(text) > self.max_length:
+        return text[:self.max_length] + "...[TRUNCATED]", True
+    return text, False
+
+  async def parse_message_content(self, content: Union[str, List[Union[str, Dict]]]) -> tuple[str, list[dict], bool]:
+      """Parses LangChain Message Content (str or list of dicts)."""
+      content_parts = []
+      summary_text = []
+      is_truncated = False
+
+      # Normalize input to list of parts
+      if isinstance(content, str):
+          raw_parts = [content]
+      elif isinstance(content, list):
+          raw_parts = content
+      else:
+          raw_parts = [str(content)]
+
+      for idx, part in enumerate(raw_parts):
+          part_data = {
+              "part_index": idx,
+              "mime_type": "text/plain",
+              "uri": None,
+              "text": None,
+              "part_attributes": "{}",
+              "storage_mode": "INLINE",
+          }
+
+          # Handle String Part
+          if isinstance(part, str):
+             text_len = len(part.encode("utf-8"))
+             if self.offloader and text_len > self.inline_text_limit:
+                 path = f"{datetime.now().date()}/{self.trace_id}/{self.span_id}_p{idx}.txt"
+                 try:
+                    uri = await self.offloader.upload_content(part, "text/plain", path)
+                    part_data["storage_mode"] = "GCS_REFERENCE"
+                    part_data["uri"] = uri
+                    part_data["text"] = part[:200] + "... [OFFLOADED]"
+                 except Exception as e:
+                    logger.warning("Failed to offload text to GCS: %s", e)
+                    clean, trunc = self._truncate(part)
+                    if trunc: is_truncated = True
+                    part_data["text"] = clean
+                    summary_text.append(clean)
+             else:
+                  clean, trunc = self._truncate(part)
+                  if trunc: is_truncated = True
+                  part_data["text"] = clean
+                  summary_text.append(clean)
+          
+          # Handle Dict Part (Multi-Modal)
+          elif isinstance(part, dict):
+              part_type = part.get("type")
+              
+              if part_type == "text":
+                  text_val = part.get("text", "")
+                  text_len = len(text_val.encode("utf-8"))
+                  if self.offloader and text_len > self.inline_text_limit:
+                      path = f"{datetime.now().date()}/{self.trace_id}/{self.span_id}_p{idx}.txt"
+                      try:
+                        uri = await self.offloader.upload_content(text_val, "text/plain", path)
+                        part_data["storage_mode"] = "GCS_REFERENCE"
+                        part_data["uri"] = uri
+                        part_data["text"] = text_val[:200] + "... [OFFLOADED]"
+                      except Exception as e:
+                        logger.warning("Failed to offload text to GCS: %s", e)
+                        clean, trunc = self._truncate(text_val)
+                        if trunc: is_truncated = True
+                        part_data["text"] = clean
+                        summary_text.append(clean)
+                  else:
+                      clean, trunc = self._truncate(text_val)
+                      if trunc: is_truncated = True
+                      part_data["text"] = clean
+                      summary_text.append(clean)
+              
+              elif part_type == "image_url":
+                  img_url_obj = part.get("image_url", {})
+                  url = img_url_obj.get("url") if isinstance(img_url_obj, dict) else img_url_obj
+                  
+                  part_data["mime_type"] = "image/jpeg" # Default/Guess
+                  if url and url.startswith("data:"):
+                      # Base64 Image
+                      if self.offloader:
+                          try:
+                              header, encoded = url.split(",", 1)
+                              mime_type = header.split(":")[1].split(";")[0]
+                              import base64
+                              data = base64.b64decode(encoded)
+                              ext = mimetypes.guess_extension(mime_type) or ".bin"
+                              path = f"{datetime.now().date()}/{self.trace_id}/{self.span_id}_p{idx}{ext}"
+                              uri = await self.offloader.upload_content(data, mime_type, path)
+                              part_data["storage_mode"] = "GCS_REFERENCE"
+                              part_data["uri"] = uri
+                              part_data["mime_type"] = mime_type
+                              part_data["text"] = "[MEDIA OFFLOADED]"
+                          except Exception as e:
+                              logger.warning("Failed to offload base64 image to GCS: %s", e)
+                              part_data["text"] = "[UPLOAD FAILED]"
+                      else:
+                           part_data["text"] = "[BASE64 IMAGE]"
+                  elif url:
+                      part_data["uri"] = url
+                      part_data["storage_mode"] = "EXTERNAL_URI"
+                      part_data["text"] = "[IMAGE URL]"
+                  
+                  summary_text.append("[IMAGE]")
+              
+              elif part_type == "tool_use":
+                   part_data["mime_type"] = "application/json"
+                   part_data["text"] = f"Tool Call: {part.get('name')}"
+                   part_data["part_attributes"] = json.dumps({"tool_id": part.get("id"), "name": part.get("name")})
+                   summary_text.append(f"[TOOL: {part.get('name')}]")
+
+          content_parts.append(part_data)
+
+      full_summary = " | ".join(summary_text)
+      return full_summary, content_parts, is_truncated
+
+
+# ==============================================================================
+# MAIN CALLBACK HANDLER
+# ==============================================================================
+
+class BigQueryCallbackHandler(AsyncCallbackHandler):
+  """BigQuery Callback Handler for LangChain (Aligned with ADK Agent Analytics Plugin)."""
+
+  def __init__(
+      self,
+      project_id: str,
+      dataset_id: str,
+      table_id: Optional[str] = None,
+      config: Optional[BigQueryLoggerConfig] = None,
+      session_id: Optional[str] = None,
+      user_id: Optional[str] = None
+  ) -> None:
+    super().__init__()
+    (
+        self.bigquery,
+        self.google_auth,
+        self.gapic_client_info,
+        self.async_client,
+        self.cloud_exceptions,
+        self.storage,
+        self.bq_schema,
+        self.bq_storage_types,
+        self.api_core_exceptions,
+        self.pa,
+    ) = import_google_cloud_bigquery()
+
+    self.project_id = project_id
+    self.dataset_id = dataset_id
+    self.config = config or BigQueryLoggerConfig()
+    if table_id: self.config.table_id = table_id
+    self.session_id = session_id or str(uuid.uuid4())
+    self.user_id = user_id
+    
+    self._started = False
+    self._is_shutting_down = False
+    self._setup_lock = asyncio.Lock()
+    
+    self.client = None
+    self.write_client = None
+    self.batch_processor = None
+    self._executor = ThreadPoolExecutor(max_workers=1)
+    self.offloader: Optional[GCSOffloader] = None
+    self._arrow_schema = None
+
+  def _get_events_schema(self) -> list[Any]:
+    return [
+      self.bigquery.SchemaField("timestamp", "TIMESTAMP", mode="REQUIRED", description="The UTC timestamp when the event occurred."),
+      self.bigquery.SchemaField("event_type", "STRING", mode="NULLABLE", description="The category of the event."),
+      self.bigquery.SchemaField("agent", "STRING", mode="NULLABLE", description="The name of the agent."),
+      self.bigquery.SchemaField("session_id", "STRING", mode="NULLABLE", description="A unique identifier for the conversation session."),
+      self.bigquery.SchemaField("invocation_id", "STRING", mode="NULLABLE", description="A unique identifier for a single turn."),
+      self.bigquery.SchemaField("user_id", "STRING", mode="NULLABLE", description="The identifier of the end-user."),
+      self.bigquery.SchemaField("trace_id", "STRING", mode="NULLABLE", description="OpenTelemetry trace ID."),
+      self.bigquery.SchemaField("span_id", "STRING", mode="NULLABLE", description="OpenTelemetry span ID."),
+      self.bigquery.SchemaField("parent_span_id", "STRING", mode="NULLABLE", description="OpenTelemetry parent span ID."),
+      self.bigquery.SchemaField("content", "JSON", mode="NULLABLE", description="The primary payload of the event."),
+      self.bigquery.SchemaField("content_parts", "RECORD", mode="REPEATED", fields=[
+          self.bigquery.SchemaField("mime_type", "STRING", mode="NULLABLE"),
+          self.bigquery.SchemaField("uri", "STRING", mode="NULLABLE"),
+          self.bigquery.SchemaField("text", "STRING", mode="NULLABLE"),
+          self.bigquery.SchemaField("part_index", "INTEGER", mode="NULLABLE"),
+          self.bigquery.SchemaField("part_attributes", "STRING", mode="NULLABLE"),
+          self.bigquery.SchemaField("storage_mode", "STRING", mode="NULLABLE"),
+      ], description="For multi-modal events, contains a list of content parts."),
+      self.bigquery.SchemaField("attributes", "JSON", mode="NULLABLE", description="Arbitrary key-value pairs."),
+      self.bigquery.SchemaField("latency_ms", "JSON", mode="NULLABLE", description="Latency measurements."),
+      self.bigquery.SchemaField("status", "STRING", mode="NULLABLE", description="The outcome of the event."),
+      self.bigquery.SchemaField("error_message", "STRING", mode="NULLABLE", description="Detailed error message."),
+      self.bigquery.SchemaField("is_truncated", "BOOLEAN", mode="NULLABLE", description="Flag indicating if content was truncated."),
+    ]
+  
+  def to_arrow_schema(self, bq_schema_list: list[Any]) -> Optional[Any]:
+    import pyarrow as pa
+    
+    # --- PyArrow Helper Functions ---
+    def _pyarrow_datetime() -> pa.DataType:
+      return pa.timestamp("us", tz=None)
+
+    def _pyarrow_numeric() -> pa.DataType:
+      return pa.decimal128(38, 9)
+
+    def _pyarrow_bignumeric() -> pa.DataType:
+      return pa.decimal256(76, 38)
+
+    def _pyarrow_time() -> pa.DataType:
+      return pa.time64("us")
+
+    def _pyarrow_timestamp() -> pa.DataType:
+      return pa.timestamp("us", tz="UTC")
+
+    _BQ_TO_ARROW_SCALARS = MappingProxyType({
+        "BOOL": pa.bool_, "BOOLEAN": pa.bool_, "BYTES": pa.binary, "DATE": pa.date32,
+        "DATETIME": _pyarrow_datetime, "FLOAT": pa.float64, "FLOAT64": pa.float64,
+        "GEOGRAPHY": pa.string, "INT64": pa.int64, "INTEGER": pa.int64,
+        "JSON": pa.string, "NUMERIC": _pyarrow_numeric, "BIGNUMERIC": _pyarrow_bignumeric,
+        "STRING": pa.string, "TIME": _pyarrow_time, "TIMESTAMP": _pyarrow_timestamp,
+    })
+
+    _BQ_FIELD_TYPE_TO_ARROW_FIELD_METADATA = {
+        "GEOGRAPHY": {b"ARROW:extension:name": b"google:sqlType:geography", b"ARROW:extension:metadata": b'{"encoding": "WKT"}'},
+        "DATETIME": {b"ARROW:extension:name": b"google:sqlType:datetime"},
+        "JSON": {b"ARROW:extension:name": b"google:sqlType:json"},
+    }
+    _STRUCT_TYPES = ("RECORD", "STRUCT")
+
+    def _bq_to_arrow_scalars(bq_scalar: str) -> Optional[Callable[[], pa.DataType]]:
+      return _BQ_TO_ARROW_SCALARS.get(bq_scalar)
+
+    def _bq_to_arrow_field(bq_field: Any) -> Optional[pa.Field]:
+      arrow_type = _bq_to_arrow_data_type(bq_field)
+      if arrow_type:
+        metadata = _BQ_FIELD_TYPE_TO_ARROW_FIELD_METADATA.get(bq_field.field_type.upper() if bq_field.field_type else "")
+        nullable = bq_field.mode.upper() != "REQUIRED"
+        return pa.field(bq_field.name, arrow_type, nullable=nullable, metadata=metadata)
+      logger.warning("Could not determine Arrow type for field '%s' with type '%s'.", bq_field.name, bq_field.field_type)
+      return None
+
+    def _bq_to_arrow_struct_data_type(field: Any) -> Optional[pa.StructType]:
+      arrow_fields = []
+      for subfield in field.fields:
+        arrow_subfield = _bq_to_arrow_field(subfield)
+        if arrow_subfield:
+          arrow_fields.append(arrow_subfield)
+        else:
+          logger.warning("Failed to convert STRUCT/RECORD field '%s' due to subfield '%s'.", field.name, subfield.name)
+          return None
+      return pa.struct(arrow_fields)
+
+    def _bq_to_arrow_data_type(field: Any) -> Optional[pa.DataType]:
+      if field.mode == "REPEATED":
+        inner = _bq_to_arrow_data_type(self.bq_schema.SchemaField(field.name, field.field_type, fields=field.fields))
+        return pa.list_(inner) if inner else None
+      field_type_upper = field.field_type.upper() if field.field_type else ""
+      if field_type_upper in _STRUCT_TYPES:
+        return _bq_to_arrow_struct_data_type(field)
+      constructor = _bq_to_arrow_scalars(field_type_upper)
+      if constructor:
+          return constructor()
+      else:
+          logger.warning("Failed to convert BigQuery field '%s': unsupported type '%s'.", field.name, field.field_type)
+          return None
+
+    arrow_fields = []
+    for bq_field in bq_schema_list:
+      af = _bq_to_arrow_field(bq_field)
+      if af: arrow_fields.append(af)
+      else:
+          logger.error("Failed to convert schema due to field '%s'.", bq_field.name)
+          return None
+    return pa.schema(arrow_fields)
+
+  async def _ensure_started(self) -> None:
+    if self._started: return
+    async with self._setup_lock:
+        if self._started: return
+        loop = asyncio.get_running_loop()
+        
+        # 1. BQ Client
+        self.client = await loop.run_in_executor(self._executor, lambda: self.bigquery.Client(project=self.project_id))
+        
+        # 2. Schema
+        full_table_id = f"{self.project_id}.{self.dataset_id}.{self.config.table_id}"
+        schema = self._get_events_schema()
+        await loop.run_in_executor(self._executor, lambda: self._ensure_table_exists(full_table_id, schema))
+        
+        # 3. Write Client
+        creds, _ = await loop.run_in_executor(self._executor, lambda: self.google_auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"]))
+        client_info = self.gapic_client_info.ClientInfo(user_agent=f"langchain-bq-callback")
+        self.write_client = self.async_client.BigQueryWriteAsyncClient(credentials=creds, client_info=client_info)
+        write_stream = f"projects/{self.project_id}/datasets/{self.dataset_id}/tables/{self.config.table_id}/_default"
+        
+        # 4. Batch Processor
+        arrow_schema = self.to_arrow_schema(schema)
+        if self.config.gcs_bucket_name:
+            self.offloader = GCSOffloader(self.project_id, self.config.gcs_bucket_name, self._executor, self.storage.Client)
+            
+        self.batch_processor = BatchProcessor(self.write_client, arrow_schema, write_stream, 
+                                              self.config.batch_size, self.config.batch_flush_interval, 
+                                              self.config.retry_config, self.config.queue_max_size,
+                                              self.bq_storage_types,
+                                              self.api_core_exceptions.ServiceUnavailable)
+        await self.batch_processor.start()
+        self._started = True
+
+  def _ensure_table_exists(self, table_id, schema):
+      try:
+          self.client.get_table(table_id)
+      except self.cloud_exceptions.NotFound:
+          tbl = self.bigquery.Table(table_id, schema=schema)
+          tbl.time_partitioning = self.bigquery.TimePartitioning(type_=self.bigquery.TimePartitioningType.DAY, field="timestamp")
+          tbl.clustering_fields = self.config.clustering_fields
+          self.client.create_table(tbl)
+
+  async def _log(self, event_type: str, run_id: uuid.UUID, content: Any = None, 
+                 parent_run_id: uuid.UUID = None, attributes: dict = None, 
+                 error: str = None, agent_name: str = "langchain", latency: int = None):
+      if not self.config.enabled: return
+      await self._ensure_started()
+
+      # Parse content using LangChainContentParser for Multi-Modal Support
+      trace_id = str(run_id)
+      span_id = str(run_id)
+      
+      parser = LangChainContentParser(self.offloader, trace_id, span_id, self.config.max_content_length)
+      
+      summary_text = ""
+      content_parts = []
+      is_truncated = False
+
+      if isinstance(content, dict) and "messages" in content:
+          # Handle Chat Model Messages (Multi-Modal Potential)
+          all_parts = []
+          # Flatten all messages to find parts
+          for msg in content["messages"]:
+              msg_content = msg.get("content")
+              s, p, t = await parser.parse_message_content(msg_content)
+              if t: is_truncated = True
+              all_parts.extend(p)
+              if summary_text: summary_text += " | "
+              summary_text += s
+          content_parts = all_parts
+      
+      elif isinstance(content, dict) and "prompts" in content:
+           # Legacy LLM (list of strings)
+           for p_str in content["prompts"]:
+               s, p, t = await parser.parse_message_content(p_str)
+               if t: is_truncated = True
+               content_parts.extend(p)
+               if summary_text: summary_text += " | "
+               summary_text += s
+      
+      elif isinstance(content, str):
+           summary_text, content_parts, is_truncated = await parser.parse_message_content(content)
+      
+      else:
+           # Fallback
+           summary_text, is_truncated = _recursive_smart_truncate(str(content), self.config.max_content_length)
+
+      row = {
+          "timestamp": datetime.now(timezone.utc),
+          "event_type": event_type,
+          "agent": agent_name,
+          "session_id": self.session_id,
+          "invocation_id": str(run_id),
+          "user_id": self.user_id,
+          "trace_id": trace_id, 
+          "span_id": span_id,
+          "parent_span_id": str(parent_run_id) if parent_run_id else None,
+          "content": {"summary": summary_text}, # Store summary in main content JSON
+          "content_parts": content_parts if self.config.log_multi_modal_content else [],
+          "attributes": json.dumps(attributes) if attributes else None,
+          "latency_ms": {"total_ms": latency} if latency else None,
+          "status": "ERROR" if error else "OK",
+          "error_message": error,
+          "is_truncated": is_truncated
+      }
+      await self.batch_processor.append(row)
+
+  async def shutdown(self):
+      if self._is_shutting_down: return
+      self._is_shutting_down = True
+      if self.batch_processor: await self.batch_processor.shutdown()
+      self._executor.shutdown(wait=True)
+      self._is_shutting_down = False
+
+  async def __aenter__(self):
+      await self._ensure_started()
+      return self
+
+  async def __aexit__(self, exc_type, exc_val, exc_tb):
+      await self.shutdown()
+
+  # --- Callbacks ---
+
+  async def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, tags: Optional[List[str]] = None, **kwargs: Any) -> None:
+      await self._log("LLM_REQUEST", run_id, content={"prompts": prompts}, parent_run_id=parent_run_id, attributes={"tags": tags, "model": serialized.get("name")})
+
+  async def on_chat_model_start(self, serialized: Dict[str, Any], messages: List[List[BaseMessage]], *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, tags: Optional[List[str]] = None, **kwargs: Any) -> None:
+      # Serialize messages safely for parsing
+      flat_msgs = [m.dict() for sub in messages for m in sub]
+      await self._log("LLM_REQUEST", run_id, content={"messages": flat_msgs}, parent_run_id=parent_run_id, attributes={"tags": tags, "model": serialized.get("name")})
+
+  async def on_llm_end(self, response: LLMResult, *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      resp_text = response.generations[0][0].text if response.generations else ""
+      usage = response.llm_output.get("token_usage") if response.llm_output else None
+      await self._log("LLM_RESPONSE", run_id, content=resp_text, parent_run_id=parent_run_id, attributes={"usage": usage})
+
+  async def on_llm_error(self, error: BaseException, *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      await self._log("LLM_ERROR", run_id, error=str(error), parent_run_id=parent_run_id)
+
+  async def on_chain_start(self, serialized: Dict[str, Any], inputs: Dict[str, Any], *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      await self._log("CHAIN_START", run_id, content=json.dumps(inputs, default=str), parent_run_id=parent_run_id, agent_name=serialized.get("name", "chain"))
+
+  async def on_chain_end(self, outputs: Dict[str, Any], *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      await self._log("CHAIN_END", run_id, content=json.dumps(outputs, default=str), parent_run_id=parent_run_id)
+
+  async def on_tool_start(self, serialized: Dict[str, Any], input_str: str, *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      await self._log("TOOL_STARTING", run_id, content=input_str, parent_run_id=parent_run_id, agent_name=serialized.get("name", "tool"))
+
+  async def on_tool_end(self, output: str, *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      await self._log("TOOL_COMPLETED", run_id, content=output, parent_run_id=parent_run_id)
+
+  async def on_tool_error(self, error: BaseException, *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      await self._log("TOOL_ERROR", run_id, error=str(error), parent_run_id=parent_run_id)
+
+  async def on_retriever_start(self, serialized: Dict[str, Any], query: str, *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      await self._log("RETRIEVER_START", run_id, content=query, parent_run_id=parent_run_id, agent_name=serialized.get("name", "retriever"))
+
+  async def on_retriever_end(self, documents: Any, *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      docs = [doc.dict() for doc in documents]
+      await self._log("RETRIEVER_END", run_id, content=json.dumps(docs, default=str), parent_run_id=parent_run_id)
+
+  async def on_retriever_error(self, error: BaseException, *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      await self._log("RETRIEVER_ERROR", run_id, error=str(error), parent_run_id=parent_run_id)
+
+  async def on_text(self, text: str, *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      await self._log("TEXT", run_id, content=text, parent_run_id=parent_run_id)
+
+  async def on_agent_action(self, action: AgentAction, *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      await self._log("AGENT_ACTION", run_id, content=json.dumps({"tool": action.tool, "input": str(action.tool_input)}, default=str), parent_run_id=parent_run_id)
+
+  async def on_agent_finish(self, finish: AgentFinish, *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      await self._log("AGENT_FINISH", run_id, content=json.dumps({"output": finish.return_values}, default=str), parent_run_id=parent_run_id)
+
+  async def on_chain_error(self, error: BaseException, *, run_id: uuid.UUID, parent_run_id: Optional[uuid.UUID] = None, **kwargs: Any) -> None:
+      await self._log("CHAIN_ERROR", run_id, error=str(error), parent_run_id=parent_run_id)
+
+  async def close(self) -> None:
+      await self.shutdown()
