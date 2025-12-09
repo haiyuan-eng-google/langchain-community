@@ -106,6 +106,7 @@ class BigQueryLoggerConfig:
   shutdown_timeout: float = 10.0
   queue_max_size: int = 10000
   gcs_bucket_name: Optional[str] = None
+  connection_id: Optional[str] = None
 
 
 # ==============================================================================
@@ -296,11 +297,12 @@ class GCSOffloader:
 class LangChainContentParser:
   """Parses LangChain content (including Multi-Modal) for logging, aligned with HybridContentParser."""
   
-  def __init__(self, offloader: Optional[GCSOffloader], trace_id: str, span_id: str, max_length: int = 20000):
+  def __init__(self, offloader: Optional[GCSOffloader], trace_id: str, span_id: str, max_length: int = 20000, connection_id: Optional[str] = None):
     self.offloader = offloader
     self.trace_id = trace_id
     self.span_id = span_id
     self.max_length = max_length
+    self.connection_id = connection_id
     self.inline_text_limit = 32 * 1024
 
   def _truncate(self, text: str) -> tuple[str, bool]:
@@ -341,6 +343,9 @@ class LangChainContentParser:
                     uri = await self.offloader.upload_content(part, "text/plain", path)
                     part_data["storage_mode"] = "GCS_REFERENCE"
                     part_data["uri"] = uri
+                    object_ref = {"uri": uri}
+                    if self.connection_id: object_ref["authorizer"] = self.connection_id
+                    part_data["object_ref"] = object_ref
                     part_data["text"] = part[:200] + "... [OFFLOADED]"
                  except Exception as e:
                     logger.warning("Failed to offload text to GCS: %s", e)
@@ -367,6 +372,9 @@ class LangChainContentParser:
                         uri = await self.offloader.upload_content(text_val, "text/plain", path)
                         part_data["storage_mode"] = "GCS_REFERENCE"
                         part_data["uri"] = uri
+                        object_ref = {"uri": uri}
+                        if self.connection_id: object_ref["authorizer"] = self.connection_id
+                        part_data["object_ref"] = object_ref
                         part_data["text"] = text_val[:200] + "... [OFFLOADED]"
                       except Exception as e:
                         logger.warning("Failed to offload text to GCS: %s", e)
@@ -398,6 +406,9 @@ class LangChainContentParser:
                               uri = await self.offloader.upload_content(data, mime_type, path)
                               part_data["storage_mode"] = "GCS_REFERENCE"
                               part_data["uri"] = uri
+                              object_ref = {"uri": uri}
+                              if self.connection_id: object_ref["authorizer"] = self.connection_id
+                              part_data["object_ref"] = object_ref
                               part_data["mime_type"] = mime_type
                               part_data["text"] = "[MEDIA OFFLOADED]"
                           except Exception as e:
@@ -631,7 +642,7 @@ class BigQueryCallbackHandler(AsyncCallbackHandler):
       trace_id = str(run_id)
       span_id = str(run_id)
       
-      parser = LangChainContentParser(self.offloader, trace_id, span_id, self.config.max_content_length)
+      parser = LangChainContentParser(self.offloader, trace_id, span_id, self.config.max_content_length, connection_id=self.config.connection_id)
       
       summary_text = ""
       content_parts = []
